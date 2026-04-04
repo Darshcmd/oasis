@@ -3,7 +3,7 @@
 #define RELAY_PIN 23
 
 float EMPTY_DIST = 12.0;
-float FULL_DIST  = 3.0;
+float FULL_DIST = 3.0;
 
 int ON_THRESHOLD = 90;
 int OFF_THRESHOLD = 70;
@@ -46,13 +46,13 @@ void setup() {
 }
 
 void loop() {
-
   distance = getDistance();
 
-  // Raw %
-  float rawPercentage = (EMPTY_DIST - distance) * 100.0 / (EMPTY_DIST - FULL_DIST);
+  // Raw percentage
+  float rawPercentage =
+      (EMPTY_DIST - distance) * 100.0 / (EMPTY_DIST - FULL_DIST);
 
-  // 🔥 Normalized %
+  // Normalized percentage
   percentage = 0.7 * rawPercentage + 44;
 
   // Clamp

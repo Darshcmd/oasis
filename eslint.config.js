@@ -26,4 +26,11 @@ export default defineConfig([
       'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
     },
   },
+  {
+    files: ['bridge-server/**/*.js'],
+    languageOptions: {
+      globals: globals.node,
+      sourceType: 'module',
+    },
+  },
 ])

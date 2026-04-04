@@ -223,6 +223,14 @@
   font-size: 0.85rem;
 }
 
+.stream-message {
+  max-width: 300px;
+  text-align: right;
+  font-size: 0.74rem;
+  line-height: 1.35;
+  color: #376771;
+}
+
 .kpi-card {
   border-radius: 16px;
   border-width: 0;
@@ -321,14 +329,16 @@
 
 .chart-card,
 .alerts-card,
-.json-card {
+.json-card,
+.serial-card {
   border-width: 0;
   border-radius: 18px;
 }
 
 .chart-card .card-header,
 .alerts-card .card-header,
-.json-card .card-header {
+.json-card .card-header,
+.serial-card .card-header {
   background: transparent;
   border-bottom: 1px solid rgba(36, 107, 122, 0.16);
 }
@@ -437,6 +447,55 @@
   font-size: 0.82rem;
 }
 
+.serial-body {
+  padding-top: 12px;
+}
+
+.serial-monitor {
+  border-radius: 12px;
+  border: 1px solid rgba(62, 125, 142, 0.22);
+  background: #071722;
+  color: #d4efff;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.42;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 10px;
+  display: grid;
+  gap: 7px;
+}
+
+.serial-monitor::-webkit-scrollbar {
+  width: 8px;
+}
+
+.serial-monitor::-webkit-scrollbar-thumb {
+  background: rgba(109, 189, 220, 0.35);
+  border-radius: 999px;
+}
+
+.serial-line {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.serial-time {
+  color: #89bdd6;
+  opacity: 0.95;
+}
+
+.serial-text {
+  color: #d4efff;
+  word-break: break-word;
+}
+
+.serial-line-status .serial-text {
+  color: #ffd38e;
+}
+
 .reveal {
   opacity: 0;
   transform: translateY(12px);
@@ -498,6 +557,11 @@
 
   .status-meta {
     justify-items: start;
+  }
+
+  .stream-message {
+    text-align: left;
+    max-width: 100%;
   }
 
   .chart-wrap {

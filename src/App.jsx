@@ -47,14 +47,46 @@ ChartJS.register(
   Filler,
 )
 
-const TICK_MS = 2000
+const BRIDGE_SOCKET_URL = import.meta.env.VITE_BRIDGE_WS_URL || 'ws://127.0.0.1:3001'
 const CHART_WINDOW_POINTS = 42
 const ALERT_LOG_LIMIT = 24
 const LEAK_WINDOW_MS = 5 * 60 * 1000
+const STALE_STREAM_MS = 10_000
+const STALE_CHECK_INTERVAL_MS = 1_000
+const RECONNECT_MAX_MS = 10_000
+const SERIAL_LOG_LIMIT = 120
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max)
 
-const randomInRange = (min, max) => Math.random() * (max - min) + min
+const firstDefined = (...values) =>
+  values.find((value) => value !== undefined && value !== null && value !== '')
+
+const toFiniteNumber = (value) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const toBoolean = (value) => {
+  if (typeof value === 'boolean') {
+    return value
+  }
+
+  if (typeof value === 'number') {
+    if (value === 1) return true
+    if (value === 0) return false
+    return undefined
+  }
+
+  if (typeof value !== 'string') {
+    return undefined
+  }
+
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+
+  return undefined
+}
 
 const toTimeLabel = (timestamp) =>
   new Date(timestamp).toLocaleTimeString([], {
@@ -62,6 +94,29 @@ const toTimeLabel = (timestamp) =>
     minute: '2-digit',
     second: '2-digit',
   })
+
+const prependSerialLog = (logs, text, timestamp, kind = 'serial') => {
+  if (!text || typeof text !== 'string') {
+    return logs
+  }
+
+  const normalized = text.trim()
+  if (!normalized) {
+    return logs
+  }
+
+  const nextLogs = [
+    {
+      id: `${timestamp}-${kind}-${Math.round(Math.random() * 1_000_000)}`,
+      text: normalized,
+      timestamp,
+      kind,
+    },
+    ...logs,
+  ]
+
+  return nextLogs.slice(0, SERIAL_LOG_LIMIT)
+}
 
 const qualityMetaFromTds = (tds) => {
   if (tds < 300) {
@@ -175,108 +230,184 @@ const createInitialDashboardState = () => {
       {
         id: `init-${now}`,
         severity: 'Info',
-        message: 'System initialized in monitor mode.',
+        message: 'Dashboard initialized. Waiting for serial bridge telemetry.',
         timestamp: now,
       },
     ],
     lastUpdated: now,
+    lastTelemetryAt: null,
+    framesReceived: 0,
+    serialMonitorLogs: [
+      {
+        id: `serial-init-${now}`,
+        text: 'Waiting for serial lines from bridge...',
+        timestamp: now,
+        kind: 'status',
+      },
+    ],
+    streamStatus: 'connecting',
+    streamMessage: `Connecting to bridge at ${BRIDGE_SOCKET_URL}...`,
   }
 }
 
-const evolveDashboardState = (prev) => {
-  const now = Date.now()
+const normalizeTelemetryPayload = (incoming, previousLiveData) => {
+  if (!incoming || typeof incoming !== 'object') {
+    return null
+  }
+
+  const payload =
+    incoming.liveData ||
+    incoming.live_data ||
+    incoming.data ||
+    incoming.payload ||
+    incoming
+
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const waterLevelPercent = toFiniteNumber(
+    firstDefined(
+      payload.waterLevelPercent,
+      payload.water_level_percent,
+      payload.level,
+      payload['water level'],
+      payload.waterlevel,
+      payload.wl,
+    ),
+  )
+
+  const tdsPpm = toFiniteNumber(
+    firstDefined(payload.tdsPpm, payload.tds_ppm, payload.tds),
+  )
+
+  const temperatureC = toFiniteNumber(
+    firstDefined(
+      payload.temperatureC,
+      payload.temperature_c,
+      payload.temperature,
+      payload['temp c'],
+      payload.temp,
+    ),
+  )
+
+  const pumpStatus =
+    toBoolean(
+      firstDefined(
+        payload.pumpStatus,
+        payload.pump_status,
+        payload['pump state'],
+        payload.pump,
+      ),
+    ) ?? previousLiveData.pumpStatus
+
+  const tapsOpen =
+    toBoolean(firstDefined(payload.tapsOpen, payload.taps_open, payload.taps)) ??
+    previousLiveData.tapsOpen
+
+  const leakDetected = toBoolean(
+    firstDefined(payload.leakDetected, payload.leak_detected, payload.leak),
+  )
+
+  const timestamp =
+    toFiniteNumber(firstDefined(incoming.timestamp, payload.timestamp, Date.now())) ??
+    Date.now()
+
+  const hasKnownSignal =
+    waterLevelPercent !== undefined ||
+    tdsPpm !== undefined ||
+    temperatureC !== undefined ||
+    toBoolean(firstDefined(payload.pumpStatus, payload.pump_status, payload['pump state'], payload.pump)) !==
+      undefined ||
+    toBoolean(firstDefined(payload.tapsOpen, payload.taps_open, payload.taps)) !== undefined ||
+    leakDetected !== undefined
+
+  if (!hasKnownSignal) {
+    return null
+  }
+
+  return {
+    waterLevelPercent: clamp(
+      waterLevelPercent ?? previousLiveData.waterLevelPercent,
+      0,
+      100,
+    ),
+    tdsPpm: clamp(tdsPpm ?? previousLiveData.tdsPpm, 0, 5000),
+    temperatureC: clamp(
+      temperatureC ?? previousLiveData.temperatureC,
+      -20,
+      120,
+    ),
+    pumpStatus,
+    tapsOpen,
+    leakDetected,
+    timestamp,
+  }
+}
+
+const applyTelemetryState = (prev, telemetry) => {
   const previous = prev.liveData
-
-  const tapsOpen = Math.random() < 0.09 ? !previous.tapsOpen : previous.tapsOpen
-
-  let pumpStatus = previous.pumpStatus
-  if (previous.waterLevelPercent >= 90) pumpStatus = true
-  if (previous.waterLevelPercent <= 80) pumpStatus = false
-
-  const inflow = randomInRange(0.2, 1.35)
-  const consumerDrain = tapsOpen ? randomInRange(0.35, 1.1) : 0
-  const pumpDrain = pumpStatus ? randomInRange(1.7, 2.7) : 0
-  const anomalyDrop =
-    !tapsOpen && !pumpStatus && Math.random() < 0.14
-      ? randomInRange(0.45, 1.35)
-      : 0
-
-  const waterLevelPercent = clamp(
-    previous.waterLevelPercent + inflow - consumerDrain - pumpDrain - anomalyDrop,
-    0,
-    100,
-  )
-
-  const tdsSpike = anomalyDrop > 0.9 ? randomInRange(18, 44) : 0
-  const tdsPpm = clamp(
-    previous.tdsPpm + randomInRange(-20, 25) + tdsSpike,
-    110,
-    920,
-  )
-
-  const temperatureC = clamp(
-    previous.temperatureC + randomInRange(-0.35, 0.4) + (pumpStatus ? 0.05 : 0),
-    18,
-    39,
-  )
+  const now = telemetry.timestamp
 
   const levelWindow = [
     ...prev.levelWindow,
-    { time: now, level: waterLevelPercent },
+    { time: now, level: telemetry.waterLevelPercent },
   ].filter((entry) => now - entry.time <= LEAK_WINDOW_MS)
 
   const oldestWindowPoint = levelWindow[0]
   const dropWithinWindow = oldestWindowPoint
-    ? oldestWindowPoint.level - waterLevelPercent
+    ? oldestWindowPoint.level - telemetry.waterLevelPercent
     : 0
 
-  const leakDetected = !tapsOpen && !pumpStatus && dropWithinWindow >= 2
+  const leakDetected =
+    telemetry.leakDetected ??
+    (!telemetry.tapsOpen && !telemetry.pumpStatus && dropWithinWindow >= 2)
 
   const liveData = {
-    waterLevelPercent,
-    tdsPpm,
-    temperatureC,
-    pumpStatus,
+    waterLevelPercent: telemetry.waterLevelPercent,
+    tdsPpm: telemetry.tdsPpm,
+    temperatureC: telemetry.temperatureC,
+    pumpStatus: telemetry.pumpStatus,
     leakDetected,
-    tapsOpen,
+    tapsOpen: telemetry.tapsOpen,
   }
 
   const systemState = getSystemState(liveData)
 
   let alerts = prev.alerts
 
-  if (!previous.pumpStatus && pumpStatus) {
+  if (!previous.pumpStatus && liveData.pumpStatus) {
     alerts = prependAlert(
       alerts,
       'Info',
-      `Pump activated automatically (${Math.round(waterLevelPercent)}% level).`,
+      `Pump activated automatically (${Math.round(liveData.waterLevelPercent)}% level).`,
       now,
     )
   }
 
-  if (previous.pumpStatus && !pumpStatus) {
+  if (previous.pumpStatus && !liveData.pumpStatus) {
     alerts = prependAlert(
       alerts,
       'Info',
-      `Pump deactivated (${Math.round(waterLevelPercent)}% level reached safe zone).`,
+      `Pump deactivated (${Math.round(liveData.waterLevelPercent)}% level reached safe zone).`,
       now,
     )
   }
 
-  if (previous.tdsPpm <= 300 && tdsPpm > 300) {
+  if (previous.tdsPpm <= 300 && liveData.tdsPpm > 300) {
     alerts = prependAlert(
       alerts,
       'Warning',
-      `TDS crossed 300 PPM (${Math.round(tdsPpm)} PPM).`,
+      `TDS crossed 300 PPM (${Math.round(liveData.tdsPpm)} PPM).`,
       now,
     )
   }
 
-  if (previous.tdsPpm <= 600 && tdsPpm > 600) {
+  if (previous.tdsPpm <= 600 && liveData.tdsPpm > 600) {
     alerts = prependAlert(
       alerts,
       'Critical',
-      `Toxicity threshold breached (${Math.round(tdsPpm)} PPM).`,
+      `Toxicity threshold breached (${Math.round(liveData.tdsPpm)} PPM).`,
       now,
     )
   }
@@ -290,7 +421,7 @@ const evolveDashboardState = (prev) => {
     )
   }
 
-  if (previous.waterLevelPercent < 100 && waterLevelPercent >= 100) {
+  if (previous.waterLevelPercent < 100 && liveData.waterLevelPercent >= 100) {
     alerts = prependAlert(
       alerts,
       'Critical',
@@ -308,19 +439,24 @@ const evolveDashboardState = (prev) => {
     {
       time: now,
       label: toTimeLabel(now),
-      waterLevelPercent,
-      tdsPpm,
-      temperatureC,
+      waterLevelPercent: liveData.waterLevelPercent,
+      tdsPpm: liveData.tdsPpm,
+      temperatureC: liveData.temperatureC,
     },
   ].slice(-CHART_WINDOW_POINTS)
 
   return {
+    ...prev,
     liveData,
     systemState,
     samples,
     levelWindow,
     alerts,
     lastUpdated: now,
+    lastTelemetryAt: now,
+    framesReceived: prev.framesReceived + 1,
+    streamStatus: 'connected',
+    streamMessage: 'Live stream active (calibrated sketch currently sends water level + pump events).',
   }
 }
 
@@ -331,19 +467,209 @@ const severityClassMap = {
   Critical: 'severity-critical',
 }
 
+const streamStatusMetaMap = {
+  connected: {
+    label: 'Connected',
+    color: 'success',
+  },
+  connecting: {
+    label: 'Connecting',
+    color: 'info',
+  },
+  reconnecting: {
+    label: 'Reconnecting',
+    color: 'warning',
+  },
+  stale: {
+    label: 'Stale',
+    color: 'warning',
+  },
+  disconnected: {
+    label: 'Disconnected',
+    color: 'danger',
+  },
+}
+
+const bridgeStatusToStreamStatus = {
+  serial_connected: 'connected',
+  serial_disconnected: 'reconnecting',
+  serial_missing: 'disconnected',
+  serial_error: 'reconnecting',
+  reconnecting: 'reconnecting',
+  stale: 'stale',
+}
+
 function App() {
   const [state, setState] = useState(createInitialDashboardState)
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      setState((prev) => evolveDashboardState(prev))
-    }, TICK_MS)
+    let socket = null
+    let reconnectTimer = null
+    let reconnectDelayMs = 1000
+    let isCancelled = false
 
-    return () => window.clearInterval(timer)
+    const setStreamStatus = (streamStatus, streamMessage) => {
+      setState((prev) => ({
+        ...prev,
+        streamStatus,
+        streamMessage,
+      }))
+    }
+
+    const connect = () => {
+      if (isCancelled) {
+        return
+      }
+
+      setStreamStatus(
+        reconnectDelayMs > 1000 ? 'reconnecting' : 'connecting',
+        `Connecting to bridge at ${BRIDGE_SOCKET_URL}...`,
+      )
+
+      socket = new WebSocket(BRIDGE_SOCKET_URL)
+
+      socket.addEventListener('open', () => {
+        reconnectDelayMs = 1000
+        setStreamStatus('connected', 'Bridge connected. Waiting for ESP32 frames...')
+      })
+
+      socket.addEventListener('message', (event) => {
+        let incoming = null
+
+        try {
+          incoming = JSON.parse(event.data)
+        } catch {
+          return
+        }
+
+        if (incoming.type === 'status') {
+          const mappedStatus = bridgeStatusToStreamStatus[incoming.status] || 'reconnecting'
+          setState((prev) => ({
+            ...prev,
+            streamStatus: mappedStatus,
+            streamMessage: incoming.message || prev.streamMessage,
+            serialMonitorLogs: prependSerialLog(
+              prev.serialMonitorLogs,
+              `[bridge] ${incoming.message || incoming.status || 'status update'}`,
+              incoming.timestamp || Date.now(),
+              'status',
+            ),
+          }))
+          return
+        }
+
+        if (incoming.type === 'hello') {
+          setState((prev) => ({
+            ...prev,
+            serialMonitorLogs:
+              prev.serialMonitorLogs.length <= 1 &&
+              Array.isArray(incoming.serialHistory)
+                ? incoming.serialHistory.reduce(
+                    (logs, entry) =>
+                      prependSerialLog(
+                        logs,
+                        entry?.line,
+                        entry?.timestamp || Date.now(),
+                        'serial',
+                      ),
+                    [],
+                  )
+                : prev.serialMonitorLogs,
+            streamStatus: 'connected',
+            streamMessage: incoming.message || prev.streamMessage,
+          }))
+          return
+        }
+
+        if (incoming.type === 'serial_line') {
+          setState((prev) => ({
+            ...prev,
+            serialMonitorLogs: prependSerialLog(
+              prev.serialMonitorLogs,
+              incoming.line,
+              incoming.timestamp || Date.now(),
+              'serial',
+            ),
+          }))
+          return
+        }
+
+        setState((prev) => {
+          const telemetry = normalizeTelemetryPayload(incoming, prev.liveData)
+          if (!telemetry) {
+            return prev
+          }
+
+          return applyTelemetryState(prev, telemetry)
+        })
+      })
+
+      socket.addEventListener('error', () => {
+        const waitSeconds = Math.max(1, Math.round(reconnectDelayMs / 1000))
+        setStreamStatus(
+          'reconnecting',
+          `Bridge error detected. Retrying in ${waitSeconds}s...`,
+        )
+      })
+
+      socket.addEventListener('close', () => {
+        if (isCancelled) {
+          return
+        }
+
+        const waitSeconds = Math.max(1, Math.round(reconnectDelayMs / 1000))
+        setStreamStatus(
+          'reconnecting',
+          `Bridge disconnected. Reconnecting in ${waitSeconds}s...`,
+        )
+
+        reconnectTimer = window.setTimeout(() => {
+          connect()
+        }, reconnectDelayMs)
+
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS)
+      })
+    }
+
+    connect()
+
+    return () => {
+      isCancelled = true
+      window.clearTimeout(reconnectTimer)
+
+      if (socket && socket.readyState < WebSocket.CLOSING) {
+        socket.close()
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const staleTimer = window.setInterval(() => {
+      setState((prev) => {
+        if (prev.streamStatus !== 'connected' || !prev.lastTelemetryAt) {
+          return prev
+        }
+
+        const ageMs = Date.now() - prev.lastTelemetryAt
+        if (ageMs < STALE_STREAM_MS) {
+          return prev
+        }
+
+        return {
+          ...prev,
+          streamStatus: 'stale',
+          streamMessage: `No telemetry received for ${Math.round(ageMs / 1000)}s.`,
+        }
+      })
+    }, STALE_CHECK_INTERVAL_MS)
+
+    return () => window.clearInterval(staleTimer)
   }, [])
 
   const statusMeta = statusMetaMap[state.systemState]
   const qualityMeta = qualityMetaFromTds(state.liveData.tdsPpm)
+  const streamStatusMeta =
+    streamStatusMetaMap[state.streamStatus] || streamStatusMetaMap.disconnected
 
   const waterLevelChartData = useMemo(
     () => ({
@@ -504,16 +830,20 @@ function App() {
               <div className="side-block-title">Live Signals</div>
               <ul className="signal-list">
                 <li>
-                  <span>Loop Interval</span>
-                  <strong>2s Sync</strong>
+                  <span>Source</span>
+                  <strong>ESP32 Serial</strong>
                 </li>
                 <li>
                   <span>Data Stream</span>
-                  <strong>Realtime Mock</strong>
+                  <strong>{streamStatusMeta.label}</strong>
                 </li>
                 <li>
-                  <span>Mode</span>
-                  <strong>Auto Control</strong>
+                  <span>Bridge URL</span>
+                  <strong>{BRIDGE_SOCKET_URL.replace('ws://', '')}</strong>
+                </li>
+                <li>
+                  <span>Frames Received</span>
+                  <strong>{state.framesReceived}</strong>
                 </li>
               </ul>
             </div>
@@ -536,9 +866,13 @@ function App() {
               </div>
               <div className="status-meta">
                 <div>Updated {toTimeLabel(state.lastUpdated)}</div>
+                <CBadge color={streamStatusMeta.color}>
+                  Stream {streamStatusMeta.label}
+                </CBadge>
                 <CBadge color={state.liveData.pumpStatus ? 'success' : 'danger'}>
                   Pump {state.liveData.pumpStatus ? 'ON' : 'OFF'}
                 </CBadge>
+                <div className="stream-message">{state.streamMessage}</div>
               </div>
             </CAlert>
 
@@ -697,7 +1031,30 @@ function App() {
                     </pre>
                     <div className="json-note">
                       <CIcon icon={cilWarning} />
-                      <span>Replace mock loop with Firebase listener in step 2.</span>
+                      <span>Live payload mirrored from serial bridge telemetry.</span>
+                    </div>
+                  </CCardBody>
+                </CCard>
+              </CCol>
+            </CRow>
+
+            <CRow className="g-4 mt-1">
+              <CCol xl={12} className="reveal reveal-5">
+                <CCard className="serial-card">
+                  <CCardHeader>
+                    <div className="card-title-row">
+                      <span>Serial Monitor Output</span>
+                      <CIcon icon={cilBolt} />
+                    </div>
+                  </CCardHeader>
+                  <CCardBody className="serial-body">
+                    <div className="serial-monitor">
+                      {state.serialMonitorLogs.map((entry) => (
+                        <div key={entry.id} className={`serial-line serial-line-${entry.kind}`}>
+                          <span className="serial-time">{toTimeLabel(entry.timestamp)}</span>
+                          <span className="serial-text">{entry.text}</span>
+                        </div>
+                      ))}
                     </div>
                   </CCardBody>
                 </CCard>
