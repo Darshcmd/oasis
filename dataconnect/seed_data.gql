@@ -1,0 +1,71 @@
+mutation SeedData @transaction @auth(level: USER, insecureReason: "This operation is for seeding data and can be executed by any authenticated user.") {
+  user1: user_insert(data: {
+    id: "a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4",
+    displayName: "Alice Wonderland",
+    email: "alice@example.com",
+    createdAt: "2023-01-01T10:00:00Z"
+  })
+  user2: user_insert(data: {
+    id: "f5f5f5f5-g6g6-h7h7-i8i8-j9j9j9j9j9j9",
+    displayName: "Bob The Builder",
+    email: "bob@example.com",
+    createdAt: "2023-01-01T10:05:00Z"
+  })
+
+  movie1: movie_insert(data: {
+    id: "10000000-0000-0000-0000-000000000001",
+    title: "The Great Adventure",
+    year: 2022,
+    summary: "A thrilling tale of exploration.",
+    genres: ["Adventure", "Action"],
+    runtime: 120,
+    createdAt: "2023-01-01T11:00:00Z"
+  })
+  movie2: movie_insert(data: {
+    id: "10000000-0000-0000-0000-000000000002",
+    title: "Mystery in the Mansion",
+    year: 2021,
+    summary: "A classic whodunit with unexpected twists.",
+    genres: ["Mystery", "Thriller"],
+    runtime: 105,
+    createdAt: "2023-01-01T11:05:00Z"
+  })
+
+  movieList1: movieList_insert(data: {
+    id: "20000000-0000-0000-0000-000000000001",
+    userId: "a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4",
+    name: "Alice's Favorite Adventures",
+    isPublic: true,
+    description: "A collection of Alice's top adventure movies.",
+    createdAt: "2023-01-01T12:00:00Z",
+    updatedAt: "2023-01-01T12:00:00Z"
+  })
+
+  movieListEntry1: movieListEntry_insert(data: {
+    movieListId: "20000000-0000-0000-0000-000000000001",
+    movieId: "10000000-0000-0000-0000-000000000001",
+    position: 1,
+    note: "Absolutely loved this one!"
+  })
+
+  watch1: watch_insert(data: {
+    id: "30000000-0000-0000-0000-000000000001",
+    userId: "a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4",
+    movieId: "10000000-0000-0000-0000-000000000001",
+    watchDate: "2023-01-02",
+    location: "Home",
+    createdAt: "2023-01-02T15:00:00Z"
+  })
+
+  review1: review_insert(data: {
+    id: "40000000-0000-0000-0000-000000000001",
+    movieId: "10000000-0000-0000-0000-000000000001",
+    userId: "a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4",
+    watchId: "30000000-0000-0000-0000-000000000001",
+    rating: 5,
+    isPublic: true,
+    reviewText: "An epic journey that kept me on the edge of my seat!",
+    createdAt: "2023-01-03T09:00:00Z",
+    updatedAt: "2023-01-03T09:00:00Z"
+  })
+}

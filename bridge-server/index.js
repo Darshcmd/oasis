@@ -1,8 +1,17 @@
+import { config as loadEnv } from 'dotenv'
 import { SerialPort } from 'serialport'
 import { WebSocketServer } from 'ws'
 import {
   BAUD_RATE,
   BRIDGE_HOST,
+  FIREBASE_ALERTS_PATH,
+  FIREBASE_DATABASE_URL,
+  FIREBASE_DEVICE_TOKENS_PATH,
+  FIREBASE_HIGH_TDS_THRESHOLD,
+  FIREBASE_SERVICE_ACCOUNT_JSON,
+  FIREBASE_SERVICE_ACCOUNT_PATH,
+  FIREBASE_SYNC_ENABLED,
+  FIREBASE_TELEMETRY_PATH,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   SERIAL_CANDIDATE_PATTERN,
@@ -11,7 +20,11 @@ import {
   STALE_STREAM_MS,
   WS_PORT,
 } from './config.js'
+import { createFirebaseSync } from './firebase-sync.js'
 import { parseTelemetryLine } from './serial-parser.js'
+
+loadEnv({ path: '.env.server' })
+loadEnv()
 
 const WS_OPEN = 1
 const SERIAL_HISTORY_LIMIT = 120
@@ -34,6 +47,18 @@ const toErrorMessage = (error) =>
 const bridgeLog = (message) => {
   console.log(`[bridge] ${message}`)
 }
+
+const firebaseSync = createFirebaseSync({
+  enabled: FIREBASE_SYNC_ENABLED,
+  databaseUrl: FIREBASE_DATABASE_URL,
+  serviceAccountPath: FIREBASE_SERVICE_ACCOUNT_PATH,
+  serviceAccountJson: FIREBASE_SERVICE_ACCOUNT_JSON,
+  telemetryPath: FIREBASE_TELEMETRY_PATH,
+  alertsPath: FIREBASE_ALERTS_PATH,
+  deviceTokensPath: FIREBASE_DEVICE_TOKENS_PATH,
+  highTdsThreshold: FIREBASE_HIGH_TDS_THRESHOLD,
+  logger: bridgeLog,
+})
 
 const wss = new WebSocketServer({
   host: BRIDGE_HOST,
@@ -169,6 +194,12 @@ const handleSerialLine = (line) => {
     type: 'telemetry',
     ...parsed.telemetry,
   })
+
+  if (firebaseSync.enabled) {
+    void firebaseSync.pushTelemetry(parsed.telemetry).catch((error) => {
+      bridgeLog(`Firebase sync write failed: ${toErrorMessage(error)}`)
+    })
+  }
 }
 
 const attachSerialListeners = (port) => {

@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CAlert,
   CBadge,
+  CButton,
   CCard,
   CCardBody,
   CCardHeader,
   CCol,
   CContainer,
+  CForm,
+  CFormInput,
   CProgress,
   CProgressBar,
   CRow,
+  CSpinner,
 } from '@coreui/react'
 import CIcon from '@coreui/icons-react'
 import {
@@ -34,7 +38,17 @@ import {
   Tooltip,
 } from 'chart.js'
 import { Line } from 'react-chartjs-2'
+import {
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+} from 'firebase/auth'
+import { onValue, ref, set } from 'firebase/database'
+import { getMessaging, getToken, isSupported, onMessage } from 'firebase/messaging'
 import './App.css'
+import { auth, database, hasFirebaseConfig } from './firebase'
 
 ChartJS.register(
   CategoryScale,
@@ -48,6 +62,28 @@ ChartJS.register(
 )
 
 const BRIDGE_SOCKET_URL = import.meta.env.VITE_BRIDGE_WS_URL || 'ws://127.0.0.1:3001'
+const FIREBASE_TELEMETRY_PATH =
+  (import.meta.env.VITE_FIREBASE_TELEMETRY_PATH || 'aqua/live_data').replace(
+    /^\/+|\/+$/g,
+    '',
+  )
+const FIREBASE_ALERTS_PATH =
+  (import.meta.env.VITE_FIREBASE_ALERTS_PATH || 'aqua/alerts').replace(/^\/+|\/+$/g, '')
+const FIREBASE_DEVICE_TOKENS_PATH =
+  (import.meta.env.VITE_FIREBASE_DEVICE_TOKENS_PATH || 'aqua/device_tokens').replace(
+    /^\/+|\/+$/g,
+    '',
+  )
+const FIREBASE_HIGH_TDS_THRESHOLD = Number.parseInt(
+  import.meta.env.VITE_FIREBASE_HIGH_TDS_THRESHOLD || '600',
+  10,
+)
+const FIREBASE_WEB_PUSH_VAPID_KEY = import.meta.env.VITE_FIREBASE_WEB_PUSH_VAPID_KEY || ''
+const FIREBASE_AUTH_DOMAIN = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || ''
+const FIREBASE_API_KEY = import.meta.env.VITE_FIREBASE_API_KEY || ''
+const FIREBASE_PROJECT_ID = import.meta.env.VITE_FIREBASE_PROJECT_ID || ''
+const FIREBASE_APP_ID = import.meta.env.VITE_FIREBASE_APP_ID || ''
+const FIREBASE_MESSAGING_SENDER_ID = import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || ''
 const CHART_WINDOW_POINTS = 42
 const ALERT_LOG_LIMIT = 24
 const LEAK_WINDOW_MS = 5 * 60 * 1000
@@ -152,7 +188,7 @@ const getSystemState = (liveData) => {
   if (
     liveData.leakDetected ||
     liveData.waterLevelPercent >= 100 ||
-    liveData.tdsPpm > 600
+    liveData.tdsPpm > FIREBASE_HIGH_TDS_THRESHOLD
   ) {
     return 'Dangerous / Critical'
   }
@@ -202,7 +238,31 @@ const prependAlert = (alerts, severity, message, timestamp) => {
   return nextAlerts.slice(0, ALERT_LOG_LIMIT)
 }
 
-const createInitialDashboardState = () => {
+const shouldNotifyForAlert = (alert) => {
+  if (!alert) {
+    return false
+  }
+
+  const normalizedMessage = alert.message.toLowerCase()
+  return (
+    normalizedMessage.includes('leak') ||
+    normalizedMessage.includes('toxicity threshold') ||
+    normalizedMessage.includes('tds crossed critical threshold')
+  )
+}
+
+const getStableTokenKey = (token) => {
+  let hash = 0
+
+  for (let index = 0; index < token.length; index += 1) {
+    hash = (hash << 5) - hash + token.charCodeAt(index)
+    hash |= 0
+  }
+
+  return `t_${Math.abs(hash)}`
+}
+
+const createInitialDashboardState = (mode = 'bridge') => {
   const now = Date.now()
   const liveData = {
     waterLevelPercent: 84,
@@ -246,7 +306,10 @@ const createInitialDashboardState = () => {
       },
     ],
     streamStatus: 'connecting',
-    streamMessage: `Connecting to bridge at ${BRIDGE_SOCKET_URL}...`,
+    streamMessage:
+      mode === 'firebase'
+        ? `Waiting for Firebase data at ${FIREBASE_TELEMETRY_PATH}...`
+        : `Connecting to bridge at ${BRIDGE_SOCKET_URL}...`,
   }
 }
 
@@ -403,7 +466,10 @@ const applyTelemetryState = (prev, telemetry) => {
     )
   }
 
-  if (previous.tdsPpm <= 600 && liveData.tdsPpm > 600) {
+  if (
+    previous.tdsPpm <= FIREBASE_HIGH_TDS_THRESHOLD &&
+    liveData.tdsPpm > FIREBASE_HIGH_TDS_THRESHOLD
+  ) {
     alerts = prependAlert(
       alerts,
       'Critical',
@@ -500,9 +566,43 @@ const bridgeStatusToStreamStatus = {
 }
 
 function App() {
-  const [state, setState] = useState(createInitialDashboardState)
+  const dataSourceMode = hasFirebaseConfig ? 'firebase' : 'bridge'
+  const [state, setState] = useState(() => createInitialDashboardState(dataSourceMode))
+  const [authUser, setAuthUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(hasFirebaseConfig)
+  const [authError, setAuthError] = useState('')
+  const [authForm, setAuthForm] = useState({
+    email: '',
+    password: '',
+  })
+  const [signingIn, setSigningIn] = useState(false)
+  const [googleSigningIn, setGoogleSigningIn] = useState(false)
+  const [pushStatus, setPushStatus] = useState('idle')
+  const [notificationPermission, setNotificationPermission] = useState(() =>
+    typeof Notification === 'undefined' ? 'unsupported' : Notification.permission,
+  )
+  const lastNotifiedAlertIdRef = useRef(null)
 
   useEffect(() => {
+    if (!hasFirebaseConfig || !auth) {
+      setAuthLoading(false)
+      return undefined
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setAuthUser(user)
+      setAuthLoading(false)
+      setAuthError('')
+    })
+
+    return () => unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (dataSourceMode !== 'bridge') {
+      return undefined
+    }
+
     let socket = null
     let reconnectTimer = null
     let reconnectDelayMs = 1000
@@ -641,7 +741,85 @@ function App() {
         socket.close()
       }
     }
-  }, [])
+  }, [dataSourceMode])
+
+  useEffect(() => {
+    if (dataSourceMode !== 'firebase' || !database || !authUser) {
+      return undefined
+    }
+
+    setState((prev) => ({
+      ...prev,
+      streamStatus: 'connecting',
+      streamMessage: `Connecting to Firebase path ${FIREBASE_TELEMETRY_PATH}...`,
+    }))
+
+    const telemetryRef = ref(database, FIREBASE_TELEMETRY_PATH)
+    const alertsRef = ref(database, FIREBASE_ALERTS_PATH)
+
+    const unsubscribeTelemetry = onValue(telemetryRef, (snapshot) => {
+      const incoming = snapshot.val()
+
+      if (!incoming) {
+        setState((prev) => ({
+          ...prev,
+          streamStatus: 'connecting',
+          streamMessage: `Waiting for telemetry in ${FIREBASE_TELEMETRY_PATH}...`,
+        }))
+        return
+      }
+
+      setState((prev) => {
+        const telemetry = normalizeTelemetryPayload(incoming, prev.liveData)
+        if (!telemetry) {
+          return prev
+        }
+
+        const next = applyTelemetryState(prev, telemetry)
+        return {
+          ...next,
+          streamStatus: 'connected',
+          streamMessage: `Live Firebase stream active (${FIREBASE_TELEMETRY_PATH}).`,
+        }
+      })
+    })
+
+    const unsubscribeAlerts = onValue(alertsRef, (snapshot) => {
+      const value = snapshot.val()
+      if (!value || typeof value !== 'object') {
+        return
+      }
+
+      const entries = Object.entries(value)
+      if (entries.length === 0) {
+        return
+      }
+
+      const latestAlert = entries
+        .map(([id, payload]) => ({
+          id: `firebase-${id}`,
+          severity: payload?.severity || 'Alert',
+          message: payload?.message || 'Firebase alert raised.',
+          timestamp: Number(payload?.timestamp) || Date.now(),
+        }))
+        .sort((a, b) => b.timestamp - a.timestamp)[0]
+
+      setState((prev) => ({
+        ...prev,
+        alerts: prependAlert(
+          prev.alerts,
+          latestAlert.severity,
+          latestAlert.message,
+          latestAlert.timestamp,
+        ),
+      }))
+    })
+
+    return () => {
+      unsubscribeTelemetry()
+      unsubscribeAlerts()
+    }
+  }, [authUser, dataSourceMode])
 
   useEffect(() => {
     const staleTimer = window.setInterval(() => {
@@ -665,6 +843,204 @@ function App() {
 
     return () => window.clearInterval(staleTimer)
   }, [])
+
+  useEffect(() => {
+    const latestAlert = state.alerts[0]
+    if (!latestAlert || latestAlert.id === lastNotifiedAlertIdRef.current) {
+      return
+    }
+
+    if (!shouldNotifyForAlert(latestAlert)) {
+      lastNotifiedAlertIdRef.current = latestAlert.id
+      return
+    }
+
+    if (
+      dataSourceMode === 'firebase' ||
+      typeof Notification === 'undefined' ||
+      Notification.permission !== 'granted'
+    ) {
+      return
+    }
+
+    new Notification(`AquaSentinel ${latestAlert.severity}`, {
+      body: latestAlert.message,
+      tag: `aqua-${latestAlert.severity.toLowerCase()}`,
+    })
+
+    lastNotifiedAlertIdRef.current = latestAlert.id
+  }, [dataSourceMode, state.alerts])
+
+  useEffect(() => {
+    if (dataSourceMode !== 'firebase' || !authUser) {
+      return undefined
+    }
+
+    let unsubscribe = () => {}
+    let isCancelled = false
+
+    const bindForegroundNotifications = async () => {
+      if (!(await isSupported())) {
+        return
+      }
+
+      const messaging = getMessaging()
+      unsubscribe = onMessage(messaging, (payload) => {
+        if (isCancelled || typeof Notification === 'undefined') {
+          return
+        }
+
+        if (Notification.permission !== 'granted') {
+          return
+        }
+
+        const title = payload.notification?.title || 'AquaSentinel Alert'
+        const body = payload.notification?.body || 'Water safety event detected.'
+        new Notification(title, {
+          body,
+          tag: 'aqua-fcm-foreground',
+        })
+      })
+    }
+
+    void bindForegroundNotifications()
+
+    return () => {
+      isCancelled = true
+      unsubscribe()
+    }
+  }, [authUser, dataSourceMode])
+
+  const enablePushNotifications = async () => {
+    if (dataSourceMode !== 'firebase' || !database || !authUser) {
+      return
+    }
+
+    if (!FIREBASE_WEB_PUSH_VAPID_KEY) {
+      setAuthError('Missing VAPID key: set VITE_FIREBASE_WEB_PUSH_VAPID_KEY in .env.local')
+      return
+    }
+
+    if (typeof Notification === 'undefined') {
+      setPushStatus('unsupported')
+      return
+    }
+
+    setPushStatus('enabling')
+    const permission = await Notification.requestPermission()
+    setNotificationPermission(permission)
+
+    if (permission !== 'granted') {
+      setPushStatus('denied')
+      return
+    }
+
+    if (!(await isSupported())) {
+      setPushStatus('unsupported')
+      return
+    }
+
+    try {
+      const query = new URLSearchParams({
+        apiKey: FIREBASE_API_KEY,
+        authDomain: FIREBASE_AUTH_DOMAIN,
+        projectId: FIREBASE_PROJECT_ID,
+        appId: FIREBASE_APP_ID,
+        messagingSenderId: FIREBASE_MESSAGING_SENDER_ID,
+      })
+
+      const serviceWorkerRegistration = await navigator.serviceWorker.register(
+        `/firebase-messaging-sw.js?${query.toString()}`,
+      )
+
+      const messaging = getMessaging()
+      const token = await getToken(messaging, {
+        vapidKey: FIREBASE_WEB_PUSH_VAPID_KEY,
+        serviceWorkerRegistration,
+      })
+
+      if (!token) {
+        setPushStatus('token-missing')
+        return
+      }
+
+      const tokenKey = getStableTokenKey(token)
+
+      await set(
+        ref(database, `${FIREBASE_DEVICE_TOKENS_PATH}/${authUser.uid}/${tokenKey}`),
+        {
+          token,
+          updated_at: Date.now(),
+          platform: 'web',
+          email: authUser.email || null,
+          display_name: authUser.displayName || null,
+        },
+      )
+
+      setPushStatus('enabled')
+      setAuthError('')
+    } catch (error) {
+      setPushStatus('error')
+      setAuthError(
+        error instanceof Error
+          ? `Push setup failed: ${error.message}`
+          : 'Push setup failed. Please try again.',
+      )
+    }
+  }
+
+  const handleAuthFormChange = (field, value) => {
+    setAuthForm((prev) => ({
+      ...prev,
+      [field]: value,
+    }))
+  }
+
+  const handleSignIn = async (event) => {
+    event.preventDefault()
+    if (!auth) {
+      return
+    }
+
+    setAuthError('')
+    setSigningIn(true)
+
+    try {
+      await signInWithEmailAndPassword(auth, authForm.email.trim(), authForm.password)
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Login failed. Please try again.')
+    } finally {
+      setSigningIn(false)
+    }
+  }
+
+  const handleGoogleSignIn = async () => {
+    if (!auth) {
+      return
+    }
+
+    setAuthError('')
+    setGoogleSigningIn(true)
+
+    try {
+      const provider = new GoogleAuthProvider()
+      await signInWithPopup(auth, provider)
+    } catch (error) {
+      setAuthError(
+        error instanceof Error ? error.message : 'Google sign in failed. Please try again.',
+      )
+    } finally {
+      setGoogleSigningIn(false)
+    }
+  }
+
+  const handleSignOut = async () => {
+    if (!auth) {
+      return
+    }
+
+    await signOut(auth)
+  }
 
   const statusMeta = statusMetaMap[state.systemState]
   const qualityMeta = qualityMetaFromTds(state.liveData.tdsPpm)
@@ -813,6 +1189,73 @@ function App() {
     [],
   )
 
+  if (dataSourceMode === 'firebase' && (authLoading || !authUser)) {
+    return (
+      <div className="dashboard-root">
+        <div className="ambient-shape ambient-shape-1"></div>
+        <div className="ambient-shape ambient-shape-2"></div>
+        <div className="ambient-shape ambient-shape-3"></div>
+        <CContainer fluid className="dashboard-shell py-4 py-xl-5">
+          <div className="login-shell">
+            <CCard className="login-card">
+              <CCardHeader>
+                <div className="card-title-row">
+                  <span>Firebase Login</span>
+                  {authLoading ? <CSpinner size="sm" /> : null}
+                </div>
+              </CCardHeader>
+              <CCardBody>
+                <p className="login-copy">
+                  Sign in to access the AquaSentinel dashboard and live telemetry.
+                </p>
+                {!authLoading ? (
+                  <CForm className="login-form" onSubmit={handleSignIn}>
+                    <CButton
+                      type="button"
+                      color="light"
+                      variant="outline"
+                      onClick={handleGoogleSignIn}
+                      disabled={googleSigningIn || signingIn}
+                    >
+                      {googleSigningIn ? 'Signing in with Google...' : 'Continue with Google'}
+                    </CButton>
+                    <div className="login-divider">or use email/password</div>
+                    <CFormInput
+                      type="email"
+                      label="Email"
+                      placeholder="you@example.com"
+                      value={authForm.email}
+                      onChange={(event) =>
+                        handleAuthFormChange('email', event.target.value)
+                      }
+                      required
+                    />
+                    <CFormInput
+                      type="password"
+                      label="Password"
+                      placeholder="••••••••"
+                      value={authForm.password}
+                      onChange={(event) =>
+                        handleAuthFormChange('password', event.target.value)
+                      }
+                      required
+                    />
+                    {authError ? <CAlert color="danger">{authError}</CAlert> : null}
+                    <CButton type="submit" color="primary" disabled={signingIn}>
+                      {signingIn ? 'Signing in...' : 'Sign In'}
+                    </CButton>
+                  </CForm>
+                ) : (
+                  <div className="login-copy">Checking your Firebase session...</div>
+                )}
+              </CCardBody>
+            </CCard>
+          </div>
+        </CContainer>
+      </div>
+    )
+  }
+
   return (
     <div className="dashboard-root">
       <div className="ambient-shape ambient-shape-1"></div>
@@ -831,15 +1274,19 @@ function App() {
               <ul className="signal-list">
                 <li>
                   <span>Source</span>
-                  <strong>ESP32 Serial</strong>
+                  <strong>{dataSourceMode === 'firebase' ? 'Firebase RTDB' : 'ESP32 Serial'}</strong>
                 </li>
                 <li>
                   <span>Data Stream</span>
                   <strong>{streamStatusMeta.label}</strong>
                 </li>
                 <li>
-                  <span>Bridge URL</span>
-                  <strong>{BRIDGE_SOCKET_URL.replace('ws://', '')}</strong>
+                  <span>{dataSourceMode === 'firebase' ? 'DB Path' : 'Bridge URL'}</span>
+                  <strong>
+                    {dataSourceMode === 'firebase'
+                      ? FIREBASE_TELEMETRY_PATH
+                      : BRIDGE_SOCKET_URL.replace('ws://', '')}
+                  </strong>
                 </li>
                 <li>
                   <span>Frames Received</span>
@@ -854,6 +1301,30 @@ function App() {
                 <div className={`risk-fill risk-${statusMeta.color}`}></div>
               </div>
               <p className="risk-copy">{statusMeta.title}</p>
+              {dataSourceMode === 'firebase' ? (
+                <div className="auth-actions">
+                  <CButton
+                    color="light"
+                    size="sm"
+                    onClick={enablePushNotifications}
+                    disabled={pushStatus === 'enabling' || pushStatus === 'enabled'}
+                  >
+                    {pushStatus === 'enabled'
+                      ? 'Push Enabled'
+                      : pushStatus === 'enabling'
+                        ? 'Enabling Push...'
+                        : 'Enable Push Alerts'}
+                  </CButton>
+                  <CButton color="dark" size="sm" variant="outline" onClick={handleSignOut}>
+                    Log Out
+                  </CButton>
+                </div>
+              ) : null}
+              {dataSourceMode === 'firebase' ? (
+                <div className="push-status-note">
+                  Permission: {notificationPermission}
+                </div>
+              ) : null}
             </div>
           </aside>
 
@@ -1024,6 +1495,8 @@ function App() {
                             leak_detected: state.liveData.leakDetected,
                           },
                           system_state: state.systemState,
+                          source_mode: dataSourceMode,
+                          high_tds_threshold: FIREBASE_HIGH_TDS_THRESHOLD,
                         },
                         null,
                         2,
@@ -1031,7 +1504,11 @@ function App() {
                     </pre>
                     <div className="json-note">
                       <CIcon icon={cilWarning} />
-                      <span>Live payload mirrored from serial bridge telemetry.</span>
+                      <span>
+                        {dataSourceMode === 'firebase'
+                          ? 'Live payload mirrored from Firebase Realtime Database.'
+                          : 'Live payload mirrored from serial bridge telemetry.'}
+                      </span>
                     </div>
                   </CCardBody>
                 </CCard>
@@ -1043,7 +1520,11 @@ function App() {
                 <CCard className="serial-card">
                   <CCardHeader>
                     <div className="card-title-row">
-                      <span>Serial Monitor Output</span>
+                      <span>
+                        {dataSourceMode === 'firebase'
+                          ? 'Firebase Stream Monitor'
+                          : 'Serial Monitor Output'}
+                      </span>
                       <CIcon icon={cilBolt} />
                     </div>
                   </CCardHeader>

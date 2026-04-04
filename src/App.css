@@ -70,6 +70,46 @@
   align-items: start;
 }
 
+.login-shell {
+  min-height: calc(100vh - 48px);
+  display: grid;
+  place-items: center;
+}
+
+.login-card {
+  width: min(430px, 100%);
+  border-width: 0;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.46);
+  box-shadow:
+    0 14px 36px rgba(28, 72, 81, 0.12),
+    0 2px 4px rgba(28, 72, 81, 0.06);
+  backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.login-card .card-header {
+  background: transparent;
+  border-bottom: 1px solid rgba(36, 107, 122, 0.16);
+}
+
+.login-copy {
+  color: #325d69;
+  margin-bottom: 12px;
+}
+
+.login-form {
+  display: grid;
+  gap: 10px;
+}
+
+.login-divider {
+  text-align: center;
+  color: #4b6f79;
+  font-size: 0.8rem;
+  margin: 2px 0;
+}
+
 .glass-panel,
 .status-banner,
 .kpi-card,
@@ -178,6 +218,19 @@
   margin: 8px 0 0;
   font-size: 0.84rem;
   color: #1c4a56;
+}
+
+.auth-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.push-status-note {
+  margin-top: 8px;
+  color: #27505b;
+  font-size: 0.78rem;
 }
 
 .content-panel {
