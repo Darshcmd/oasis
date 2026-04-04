@@ -20,7 +20,9 @@ CoreUI-style React dashboard for a full-stack IoT water management system, now i
   - TDS + Temperature trend (dual-axis)
 - Live alert feed with severity tags and timestamps
 - Live serial monitor panel (raw host serial lines)
-- Firebase-ready payload preview block
+- Firebase Realtime Database sync (bridge writes telemetry + alert events)
+- Firebase login (Email/Password + Google)
+- FCM push notifications for leakage and critical TDS spikes
 - Live stream ingestion from `ESP32 -> USB Serial -> Node bridge -> WebSocket -> React`
 
 ## Live integration architecture
@@ -59,6 +61,73 @@ Pump OFF
 npm install
 ```
 
+## Steps To Start Project
+
+### 1) Firebase setup (one-time)
+
+1. Create Firebase project.
+2. Enable Realtime Database.
+3. Enable Authentication providers:
+   - Email/Password
+   - Google
+4. Generate a service account key JSON from Firebase Console and keep it locally.
+5. In Firebase Console -> Cloud Messaging, generate a **Web Push certificate key pair** and copy the VAPID public key.
+
+### 2) Frontend env
+
+Create `.env.local` in project root (already scaffolded in this repo with placeholders):
+
+```bash
+VITE_FIREBASE_API_KEY=...
+VITE_FIREBASE_AUTH_DOMAIN=<project-id>.firebaseapp.com
+VITE_FIREBASE_DATABASE_URL=https://<project-id>-default-rtdb.firebaseio.com
+VITE_FIREBASE_PROJECT_ID=<project-id>
+VITE_FIREBASE_STORAGE_BUCKET=<project-id>.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=...
+VITE_FIREBASE_APP_ID=...
+VITE_FIREBASE_WEB_PUSH_VAPID_KEY=...
+VITE_FIREBASE_TELEMETRY_PATH=aqua/live_data
+VITE_FIREBASE_ALERTS_PATH=aqua/alerts
+VITE_FIREBASE_DEVICE_TOKENS_PATH=aqua/device_tokens
+VITE_FIREBASE_HIGH_TDS_THRESHOLD=600
+```
+
+### 3) Start bridge server with Firebase sync
+
+`bridge-server/index.js` now auto-loads `.env.server` (already scaffolded with placeholders), so you can just run:
+
+```bash
+npm run server
+```
+
+If you prefer one-off env inline, this still works:
+
+```bash
+FIREBASE_SYNC_ENABLED=true \
+FIREBASE_DATABASE_URL=https://<project-id>-default-rtdb.firebaseio.com \
+FIREBASE_SERVICE_ACCOUNT_PATH=/absolute/path/serviceAccountKey.json \
+npm run server
+```
+
+### 4) Start frontend
+
+In a second terminal:
+
+```bash
+npm run dev
+```
+
+Open the shown local URL (usually `http://localhost:5173`), then:
+1. Sign in with Google or Email/Password.
+2. Click `Enable Push Alerts` once to register this browser device.
+3. Keep bridge running so telemetry continues.
+
+### 5) Optional: run frontend + bridge together (without Firebase env inline)
+
+```bash
+npm run dev:full
+```
+
 ## Run frontend only
 
 ```bash
@@ -88,12 +157,67 @@ Optional environment variables:
 - `RECONNECT_MIN_MS` (default: `1000`)
 - `RECONNECT_MAX_MS` (default: `10000`)
 - `STALE_STREAM_MS` (default: `10000`)
+- `FIREBASE_SYNC_ENABLED` (`true` or `false`, default: `false`)
+- `FIREBASE_DATABASE_URL` (example: `https://<project-id>-default-rtdb.firebaseio.com`)
+- `FIREBASE_SERVICE_ACCOUNT_PATH` (absolute path to service-account JSON)
+- `FIREBASE_SERVICE_ACCOUNT_JSON` (raw JSON string, alternative to path)
+- `FIREBASE_TELEMETRY_PATH` (default: `aqua/live_data`)
+- `FIREBASE_ALERTS_PATH` (default: `aqua/alerts`)
+- `FIREBASE_DEVICE_TOKENS_PATH` (default: `aqua/device_tokens`)
+- `FIREBASE_HIGH_TDS_THRESHOLD` (default: `600`)
 
 Example:
 
 ```bash
 SERIAL_PORT=/dev/ttyUSB0 BAUD_RATE=115200 npm run server
 ```
+
+Firebase-enabled bridge example:
+
+```bash
+FIREBASE_SYNC_ENABLED=true \
+FIREBASE_DATABASE_URL=https://<project-id>-default-rtdb.firebaseio.com \
+FIREBASE_SERVICE_ACCOUNT_PATH=/absolute/path/serviceAccountKey.json \
+npm run server
+```
+
+## Frontend Firebase configuration (Login + Realtime read)
+
+Create `.env.local`:
+
+```bash
+VITE_FIREBASE_API_KEY=...
+VITE_FIREBASE_AUTH_DOMAIN=<project-id>.firebaseapp.com
+VITE_FIREBASE_DATABASE_URL=https://<project-id>-default-rtdb.firebaseio.com
+VITE_FIREBASE_PROJECT_ID=<project-id>
+VITE_FIREBASE_STORAGE_BUCKET=<project-id>.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=...
+VITE_FIREBASE_APP_ID=...
+VITE_FIREBASE_WEB_PUSH_VAPID_KEY=...
+VITE_FIREBASE_TELEMETRY_PATH=aqua/live_data
+VITE_FIREBASE_ALERTS_PATH=aqua/alerts
+VITE_FIREBASE_DEVICE_TOKENS_PATH=aqua/device_tokens
+VITE_FIREBASE_HIGH_TDS_THRESHOLD=600
+```
+
+When these variables are present:
+
+1. Dashboard shows Firebase login (Google + email/password).
+2. After login, telemetry is read from Realtime Database path `aqua/live_data` (or your custom path).
+3. `Enable Push Alerts` stores FCM token under `aqua/device_tokens/<uid>/...`.
+4. Bridge sends FCM notifications on:
+   - leakage detection
+   - very high TDS (threshold breach)
+
+If variables are missing, app automatically falls back to local WebSocket bridge mode.
+
+Firebase console checklist:
+
+1. Enable `Authentication -> Sign-in method -> Email/Password`.
+2. Enable `Authentication -> Sign-in method -> Google`.
+3. Create at least one user in `Authentication -> Users` (for email/password mode).
+4. Set Realtime Database rules so authenticated users can read telemetry and alerts.
+5. Generate Cloud Messaging Web Push VAPID key.
 
 ## Verify quality
 
@@ -112,15 +236,22 @@ sudo usermod -a -G dialout $USER
 
 Then log out and back in.
 
-## Firebase migration (next phase)
+## Firebase Realtime payload
 
-When you are ready to move from local serial bridge to cloud syncing:
+Bridge writes live data to:
 
-1. Keep ESP32 logic but push normalized JSON to Firebase Realtime Database.
-2. Replace WebSocket listener in dashboard with Firebase `onValue` listener.
-3. Reuse the same payload fields already used in UI:
-  - `water_level_percent`
-  - `tds_ppm`
-  - `temperature_c`
-  - `pump_status`
-  - `leak_detected`
+```json
+{
+  "water_level_percent": 85,
+  "tds_ppm": 210,
+  "temperature_c": 24.5,
+  "pump_status": false,
+  "leak_detected": false,
+  "taps_open": false,
+  "timestamp": 1760000000000,
+  "system_state": "Perfect"
+}
+```
+
+Alert events are appended under `aqua/alerts`.
+# oasis
